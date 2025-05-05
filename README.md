@@ -18,7 +18,7 @@ before start the project you habe to install library below <br>
 ```
 flask==2.0.1
 
-flask-spcketio==5.1.1
+flask-socketio==5.1.1
 
 numpy==1.21.0
 
