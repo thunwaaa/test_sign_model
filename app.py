@@ -1,9 +1,17 @@
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, render_template, jsonify, request, send_from_directory, abort
 import os
 import json
 import numpy as np
+import logging
 
 app = Flask(__name__)
+
+# เพิ่มใน app.py หลังจากสร้าง app = Flask(__name__)
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+
+logging.basicConfig(level=logging.INFO)
+app.logger.setLevel(logging.INFO)
 
 #setting folder for static files
 data_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static','data')
@@ -42,19 +50,33 @@ def get_word_data(word):
 def get_processed_data(word, video_idx):
     """ดึงข้อมูลที่แปลงแล้วของวิดีโอที่ระบุ"""
     file_path = os.path.join(data_folder, f"{word}.json")
-    try: 
-        with open(file_path, 'r', encoding='wtf-8') as f:
-            word_data = json.load(f)
+    app.logger.info(f"Accessing file: {file_path}")
+    
+    try:
+        if not os.path.exists(file_path):
+            app.logger.error(f"File not found: {file_path}")
+            return jsonify({"error": f"File not found: {word}.json"}), 404
             
+        with open(file_path, 'r', encoding='utf-8') as f:
+            word_data = json.load(f)
+        
         if video_idx >= len(word_data):
             return jsonify({"error": "Video index out of range"}), 404
         
         video_data = word_data[video_idx]
-        processed_data = prepare_data_for_3d_model(video_data['landmarks'])
         
+        # ตรวจสอบว่ามีข้อมูล landmarks หรือไม่
+        if 'landmarks' not in video_data or not video_data['landmarks']:
+            return jsonify({"error": "No landmarks data found"}), 400
+            
+        # ประมวลผลข้อมูลและส่งกลับ
+        processed_data = prepare_data_for_3d_model(video_data['landmarks'])
         return jsonify(processed_data)
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 404
+        app.logger.error(f"Error processing data: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
     
 def prepare_data_for_3d_model(landmarks_data):
     """
@@ -63,11 +85,6 @@ def prepare_data_for_3d_model(landmarks_data):
     processed_data = []
     
     for frame_data in landmarks_data:
-        # ตรวจสอบว่ามีข้อมูลครบถ้วนหรือไม่
-        if not frame_data:
-            print("Empty frame data found, skipping")
-            continue
-            
         frame_3d_data = {
             'frame_idx': frame_data.get('frame_idx', 0),
             'hands': [],
@@ -76,20 +93,21 @@ def prepare_data_for_3d_model(landmarks_data):
         }
         
         # แปลงข้อมูลมือ
-        hands_data = frame_data.get('hands', [])
-        if hands_data:
-            for hand in hands_data:
-                # กรณีรูปแบบข้อมูลเก่า (ก่อนแปลง)
+        if 'hands' in frame_data and frame_data['hands']:
+            for hand in frame_data['hands']:
+                # ตรวจสอบว่าเป็นข้อมูลมือที่มี landmarks หรือไม่
                 if isinstance(hand, dict) and 'landmarks' in hand:
                     landmarks = hand['landmarks']
                     is_right = hand.get('is_right', False)
-                # กรณีรูปแบบข้อมูลใหม่ (MediaPipe แบบดิบ)
-                else:
+                elif isinstance(hand, list) and len(hand) >= 21:
+                    # กรณีที่เป็นรายการจุด
                     landmarks = hand
                     is_right = False  # ค่าเริ่มต้น
+                else:
+                    continue
                 
-                # จัดกลุ่มจุดตามส่วนของมือ
-                if landmarks and len(landmarks) >= 21:
+                # จัดกลุ่มจุดมือตามโครงสร้าง
+                if len(landmarks) >= 21:
                     hand_3d = {
                         'is_right': is_right,
                         'wrist': landmarks[0],
@@ -124,86 +142,91 @@ def prepare_data_for_3d_model(landmarks_data):
                             'tip': landmarks[20]
                         }
                     }
-                    
                     frame_3d_data['hands'].append(hand_3d)
         
         # แปลงข้อมูลท่าทาง
-        pose_data = frame_data.get('pose')
-        if pose_data and len(pose_data) >= 33:
+        if 'pose' in frame_data and frame_data['pose'] and len(frame_data['pose']) >= 33:
+            pose = frame_data['pose']
             body_3d = {
                 'head': {
-                    'nose': pose_data[0],
-                    'left_eye': pose_data[2],
-                    'right_eye': pose_data[5],
-                    'left_ear': pose_data[7],
-                    'right_ear': pose_data[8]
+                    'nose': pose[0][:3],  # ตัดค่า visibility ออก
+                    'left_eye': pose[2][:3],
+                    'right_eye': pose[5][:3],
+                    'left_ear': pose[7][:3],
+                    'right_ear': pose[8][:3]
                 },
                 'torso': {
-                    'left_shoulder': pose_data[11],
-                    'right_shoulder': pose_data[12],
-                    'left_hip': pose_data[23],
-                    'right_hip': pose_data[24]
+                    'left_shoulder': pose[11][:3],
+                    'right_shoulder': pose[12][:3],
+                    'left_hip': pose[23][:3],
+                    'right_hip': pose[24][:3]
                 },
                 'left_arm': {
-                    'shoulder': pose_data[11],
-                    'elbow': pose_data[13],
-                    'wrist': pose_data[15],
-                    'pinky': pose_data[17],
-                    'index': pose_data[19],
-                    'thumb': pose_data[21]
+                    'shoulder': pose[11][:3],
+                    'elbow': pose[13][:3],
+                    'wrist': pose[15][:3],
+                    'pinky': pose[17][:3],
+                    'index': pose[19][:3],
+                    'thumb': pose[21][:3]
                 },
                 'right_arm': {
-                    'shoulder': pose_data[12],
-                    'elbow': pose_data[14],
-                    'wrist': pose_data[16],
-                    'pinky': pose_data[18],
-                    'index': pose_data[20],
-                    'thumb': pose_data[22]
+                    'shoulder': pose[12][:3],
+                    'elbow': pose[14][:3],
+                    'wrist': pose[16][:3],
+                    'pinky': pose[18][:3],
+                    'index': pose[20][:3],
+                    'thumb': pose[22][:3]
                 }
             }
-            
             frame_3d_data['body'] = body_3d
         
-        # แปลงข้อมูลใบหน้า (ถ้ามี)
-        face_data = frame_data.get('face')
-        if face_data:
-            if isinstance(face_data, list) and len(face_data) > 0:
+        # แปลงข้อมูลใบหน้า
+        if 'face' in frame_data and frame_data['face']:
+            face_data = frame_data['face']
+            # ตรวจสอบว่าเป็นรายการของจุดหรือไม่
+            if isinstance(face_data, list):
                 # ถ้าเป็น FaceMesh (จำนวนจุดมาก)
                 if len(face_data) > 100:
+                    # ใช้ดัชนีจุดสำคัญของใบหน้า (อาจต้องปรับ)
                     face_indices = {
                         'eyebrows': list(range(46, 55)),
                         'eyes': list(range(33, 46)),
                         'nose': list(range(1, 6)),
                         'lips': list(range(61, 72)),
-                        'jaw': list(range(100, 111))
+                        'jaw': list(range(100, min(111, len(face_data))))
                     }
                     
                     face_3d = {}
                     for part, indices in face_indices.items():
-                        face_3d[part] = [face_data[i] for i in indices if i < len(face_data)]
+                        face_3d[part] = [face_data[i][:3] for i in indices if i < len(face_data)]
                 else:
                     # ถ้าเป็นข้อมูลใบหน้าพื้นฐาน
                     face_3d = {
-                        'face_landmarks': face_data
+                        'face_landmarks': [pt[:3] for pt in face_data[:min(100, len(face_data))]]
                     }
                 
                 frame_3d_data['face'] = face_3d
         
         processed_data.append(frame_3d_data)
     
-    # ตรวจสอบว่ามีข้อมูลที่ประมวลผลแล้วหรือไม่
-    if not processed_data:
-        print("No processed data produced!")
-    else:
-        print(f"Processed {len(processed_data)} frames")
-    
     return processed_data
+
+
+# เพิ่ม route เพื่อเข้าถึงไฟล์ JSON โดยตรง
+@app.route('/static/data/<filename>')
+def serve_data_file(filename):
+    """ให้เข้าถึงไฟล์ JSON โดยตรง"""
+    try:
+        return send_from_directory(data_folder, filename)
+    except Exception as e:
+        app.logger.error(f"Error serving file {filename}: {str(e)}")
+        abort(404)
 
 # เพิ่ม Route ใน app.py
 @app.route('/debug/<word>/<int:video_idx>')
 def debug_data(word, video_idx):
     """แสดงข้อมูลดิบของวิดีโอที่ระบุเพื่อการดีบัก"""
-    file_path = os.path.join(DATA_FOLDER, f"{word}.json")
+    file_path = os.path.join(data_folder, f"{word}.json")
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             word_data = json.load(f)
@@ -230,6 +253,83 @@ def debug_data(word, video_idx):
         return jsonify(debug_info)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route('/list_data')
+def list_data():
+    """แสดงรายการไฟล์ในโฟลเดอร์ data"""
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'data')
+    files = []
+    if os.path.exists(data_dir):
+        files = os.listdir(data_dir)
+    
+    return jsonify({
+        "data_directory": data_dir,
+        "exists": os.path.exists(data_dir),
+        "files": files,
+        "readable": [f for f in files if os.access(os.path.join(data_dir, f), os.R_OK)]
+    })
+
+@app.route('/peek/<word>')
+def peek_data(word):
+    """แสดงตัวอย่างข้อมูลของคำที่ระบุ"""
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'data', f"{word}.json")
+    
+    if not os.path.exists(file_path):
+        return jsonify({"error": f"File not found: {file_path}"}), 404
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        return jsonify({
+            "file": file_path,
+            "size": os.path.getsize(file_path),
+            "type": type(data).__name__,
+            "length": len(data) if isinstance(data, list) else "N/A",
+            "sample": data[0] if isinstance(data, list) and len(data) > 0 else data
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/check_data/<word>')
+def check_data(word):
+    """ตรวจสอบข้อมูลคำ"""
+    
+    file_path = os.path.join(data_folder, f"{word}.json")
+    
+    if not os.path.exists(file_path):
+        return jsonify({"error": f"File not found: {file_path}"}), 404
+        
+    file_info = {
+        "exists": os.path.exists(file_path),
+        "size": os.path.getsize(file_path) if os.path.exists(file_path) else 0,
+        "readable": os.access(file_path, os.R_OK) if os.path.exists(file_path) else False,
+        "writable": os.access(file_path, os.W_OK) if os.path.exists(file_path) else False
+    }
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        data_info = {
+            "type": type(data).__name__,
+            "length": len(data) if isinstance(data, list) else "not a list",
+            "first_item_keys": list(data[0].keys()) if isinstance(data, list) and len(data) > 0 else "N/A",
+            "has_landmarks": "landmarks" in data[0] if isinstance(data, list) and len(data) > 0 else False,
+            "landmarks_length": len(data[0].get("landmarks", [])) if isinstance(data, list) and len(data) > 0 else 0
+        }
+        
+        return jsonify({"file_info": file_info, "data_info": data_info})
+    except Exception as e:
+        return jsonify({"file_info": file_info, "error": str(e)}), 500
+# เพิ่มใน app.py
+@app.after_request
+def add_header(response):
+    response.cache_control.no_store = True
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
 
 if __name__ == '__main__':
     app.run(debug=True)
